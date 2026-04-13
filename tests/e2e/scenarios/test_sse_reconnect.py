@@ -181,6 +181,9 @@ async def test_reconnect_after_server_restart_rebuilds_history(browser, managed_
             ),
             timeout=30000,
         ):
+            # Ensure the disconnect duration exceeds the 10s time-gate so
+            # loadHistory() fires on reconnect, even if the restart is fast.
+            await page.evaluate("_sseDisconnectedAt = Date.now() - 15000")
             await managed_gateway_server.restart()
             await _wait_for_connected(page, timeout=30000)
 
