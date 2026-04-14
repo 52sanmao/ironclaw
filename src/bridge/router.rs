@@ -361,9 +361,9 @@ async fn execute_pending_gate_action(
 ) -> Result<Option<String>, Error> {
     let thread = match state.store.load_thread(pending.thread_id).await {
         Ok(Some(t)) => t,
-        Ok(None) | Err(_) => {
-            // Thread was deleted or became unreachable while the gate was
-            // pending. Emit a "gate_resolved" event with resolution "expired"
+        Ok(None) => {
+            // Thread was genuinely deleted while the gate was pending.
+            // Emit a "gate_resolved" event with resolution "expired"
             // so the frontend can dismiss the stale approval card.
             tracing::debug!(
                 thread_id = %pending.thread_id,
@@ -388,6 +388,11 @@ async fn execute_pending_gate_action(
                 );
             }
             return Ok(Some("Thread no longer exists. Approval dismissed.".into()));
+        }
+        Err(e) => {
+            // Transient DB failure -- propagate so the caller can retry
+            // rather than permanently discarding the gate.
+            return Err(engine_err("load thread", e));
         }
     };
     let resolved_call_id =
@@ -2131,13 +2136,9 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
                     .stop_thread(*tid, &message.user_id)
                     .await;
             }
-            let _ = state
-                .pending_gates
-                .discard(&PendingGateKey {
-                    user_id: message.user_id.clone(),
-                    thread_id: *tid,
-                })
-                .await;
+            // Discard all pending gates for this thread regardless of user,
+            // preventing orphaned gates that can never be resolved (#2323).
+            state.pending_gates.discard_for_thread(*tid).await;
         }
     }
 
