@@ -3417,6 +3417,7 @@ mod tests {
     use crate::types::error::EngineError;
     use crate::types::event::ThreadEvent;
     use crate::types::memory::{DocId, DocType, MemoryDoc};
+    use crate::types::message::ThreadMessage;
     use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
     use crate::types::project::{Project, ProjectId};
     use crate::types::step::StepId;
@@ -4416,7 +4417,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_insights_outcome_persists_structured_memory_doc() {
-        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let store = Arc::new(TestStore::new());
         let project_id = ProjectId::new();
         let thread_id = ThreadId::new();
 
@@ -4452,8 +4453,9 @@ mod tests {
         let outcome = ThreadOutcome::Completed {
             response: Some(response),
         };
+        let store_dyn: Arc<dyn Store> = Arc::clone(&store) as Arc<dyn Store>;
 
-        process_mission_outcome(&store, id, thread_id, &outcome)
+        process_mission_outcome(&store_dyn, id, thread_id, &outcome)
             .await
             .unwrap();
 
