@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -165,6 +165,12 @@ pub struct MissionManager {
 /// 60 s tick interval so a single tick gap is always honored, while still
 /// allowing recovery within a few minutes if the store comes back.
 const FIRE_COOLDOWN: Duration = Duration::from_secs(90);
+/// Minimum steps for a thread to be a skill extraction candidate.
+const SKILL_EXTRACTION_MIN_STEPS: usize = 5;
+/// Minimum distinct action executions for skill extraction.
+const SKILL_EXTRACTION_MIN_ACTIONS: usize = 3;
+/// Completed thread interval for conversation insights.
+const CONVERSATION_INSIGHTS_INTERVAL: u32 = 5;
 
 impl MissionManager {
     pub fn new(store: Arc<dyn Store>, thread_manager: Arc<ThreadManager>) -> Self {
@@ -1090,13 +1096,6 @@ impl MissionManager {
         let mgr = Arc::clone(self);
         let mut rx = mgr.thread_manager.subscribe_events();
 
-        /// Minimum steps for a thread to be a skill extraction candidate.
-        const SKILL_EXTRACTION_MIN_STEPS: usize = 5;
-        /// Minimum distinct action executions for skill extraction.
-        const SKILL_EXTRACTION_MIN_ACTIONS: usize = 3;
-        /// Completed thread interval for conversation insights.
-        const CONVERSATION_INSIGHTS_INTERVAL: u32 = 5;
-
         tokio::spawn(async move {
             // Track completed thread count per conversation for insights trigger.
             let mut conv_thread_counts: std::collections::HashMap<String, u32> =
@@ -1128,12 +1127,6 @@ impl MissionManager {
                             collect_errors_and_actions(&thread);
                         let active_skills = thread.active_skills();
 
-                        // ── Trigger 1: Skill repair ───────────────────────
-                        // NOTE: skill-repair and error-diagnosis can both fire
-                        // for the same thread. Each targets a different mission
-                        // so they won't collide, but both may spawn concurrent
-                        // threads. This is intentional — skill-repair fixes the
-                        // *skill* while error-diagnosis fixes the *prompt/orchestrator*.
                         if !active_skills.is_empty() {
                             let tracker = SkillTracker::new(Arc::clone(&mgr.store));
                             let success = thread_completed_successfully(&thread, &trace);
@@ -1146,167 +1139,106 @@ impl MissionManager {
                                     );
                                 }
                             }
-
-                            if let Some(payload) =
-                                build_skill_gap_payload(&thread, &trace, &active_skills)
-                                && let Err(e) = mgr
-                                    .fire_on_system_event(
-                                        "engine",
-                                        "thread_completed_with_skill_gap",
-                                        &thread.user_id,
-                                        Some(payload),
-                                    )
-                                    .await
-                            {
-                                debug!("event listener: failed to fire skill repair: {e}");
-                            }
                         }
 
-                        // ── Trigger 2: Error diagnosis ──────────────────
-                        if !trace.issues.is_empty() {
-                            let issues: Vec<serde_json::Value> = trace
-                                .issues
-                                .iter()
-                                .map(|i| {
-                                    serde_json::json!({
-                                        "severity": format!("{:?}", i.severity),
-                                        "category": i.category.clone(),
-                                        "description": i.description.clone(),
-                                        "step": i.step,
-                                    })
-                                })
-                                .collect();
+                        let conversation_completion_count =
+                            if should_count_for_conversation_insights(terminal_state) {
+                                let conv_key = thread.project_id.0.to_string();
+                                let count = conv_thread_counts.entry(conv_key).or_insert(0);
+                                *count += 1;
+                                Some(*count)
+                            } else {
+                                None
+                            };
 
-                            let payload = serde_json::json!({
-                                "source_thread_id": event.thread_id.0.to_string(),
-                                "goal": thread.goal,
-                                "issues": issues,
-                                "error_messages": error_messages,
-                            });
-
-                            if let Err(e) = mgr
-                                .fire_on_system_event(
-                                    "engine",
-                                    "thread_completed_with_issues",
-                                    &thread.user_id,
-                                    Some(payload),
-                                )
-                                .await
-                            {
-                                debug!("event listener: failed to fire error diagnosis: {e}");
-                            }
-                        }
-
-                        // ── Trigger 3: Skill extraction ──────────────────
-                        let action_count = thread
-                            .events
-                            .iter()
-                            .filter(|e| {
-                                matches!(
-                                    e.kind,
-                                    crate::types::event::EventKind::ActionExecuted { .. }
-                                )
-                            })
-                            .count();
-
-                        if terminal_state == crate::types::thread::ThreadState::Done
-                            && trace
-                                .issues
-                                .iter()
-                                .all(|i| i.severity != crate::executor::trace::IssueSeverity::Error)
-                            && thread.step_count >= SKILL_EXTRACTION_MIN_STEPS
-                            && action_count >= SKILL_EXTRACTION_MIN_ACTIONS
-                        {
-                            let actions_used: Vec<String> = thread
-                                .events
-                                .iter()
-                                .filter_map(|e| {
-                                    if let crate::types::event::EventKind::ActionExecuted {
-                                        action_name,
-                                        ..
-                                    } = &e.kind
+                        for trigger in route_learning_triggers(
+                            &thread,
+                            terminal_state,
+                            &trace,
+                            &error_messages,
+                            &active_skills,
+                            conversation_completion_count,
+                        ) {
+                            match trigger {
+                                LearningTrigger::SkillRepair { payload } => {
+                                    if let Err(e) = mgr
+                                        .fire_on_system_event(
+                                            "engine",
+                                            "thread_completed_with_skill_gap",
+                                            &thread.user_id,
+                                            Some(payload),
+                                        )
+                                        .await
                                     {
-                                        Some(action_name.clone())
-                                    } else {
-                                        None
+                                        debug!("event listener: failed to fire skill repair: {e}");
                                     }
-                                })
-                                .collect();
-
-                            let payload = serde_json::json!({
-                                "source_thread_id": event.thread_id.0.to_string(),
-                                "goal": thread.goal,
-                                "step_count": thread.step_count,
-                                "action_count": action_count,
-                                "actions_used": actions_used,
-                                "total_tokens": thread.total_tokens_used,
-                            });
-
-                            if let Err(e) = mgr
-                                .fire_on_system_event(
-                                    "engine",
-                                    "thread_completed_with_learnings",
-                                    &thread.user_id,
-                                    Some(payload),
-                                )
-                                .await
-                            {
-                                debug!("event listener: failed to fire skill extraction: {e}");
-                            }
-                        }
-
-                        // ── Trigger 4: Conversation insights ────────────
-                        // Keep insights tied to successful completions only.
-                        if should_count_for_conversation_insights(terminal_state) {
-                            // Use the thread's project_id as a proxy for conversation scope.
-                            let conv_key = thread.project_id.0.to_string();
-                            let count = conv_thread_counts.entry(conv_key.clone()).or_insert(0);
-                            *count += 1;
-
-                            if (*count).is_multiple_of(CONVERSATION_INSIGHTS_INTERVAL) {
-                                // Collect recent thread goals for context
-                                let thread_goals: Vec<String> = match mgr
-                                    .store
-                                    .list_threads(thread.project_id, &thread.user_id)
-                                    .await
-                                {
-                                    Ok(threads) => threads
-                                        .iter()
-                                        .rev()
-                                        .take(CONVERSATION_INSIGHTS_INTERVAL as usize)
-                                        .map(|t| t.goal.clone())
-                                        .collect(),
-                                    Err(_) => vec![thread.goal.clone()],
-                                };
-
-                                // Collect sample user messages from recent threads
-                                let sample_messages: Vec<String> = thread
-                                    .messages
-                                    .iter()
-                                    .filter(|m| m.role == crate::types::message::MessageRole::User)
-                                    .map(|m| m.content.chars().take(200).collect::<String>())
-                                    .take(10)
-                                    .collect();
-
-                                let payload = serde_json::json!({
-                                    "project_id": thread.project_id.0.to_string(),
-                                    "completed_thread_count": *count,
-                                    "thread_goals": thread_goals,
-                                    "sample_user_messages": sample_messages,
-                                });
-
-                                if let Err(e) = mgr
-                                    .fire_on_system_event(
-                                        "engine",
-                                        "conversation_insights_due",
-                                        &thread.user_id,
-                                        Some(payload),
-                                    )
-                                    .await
-                                {
-                                    debug!(
-                                        "event listener: failed to fire conversation insights: {e}"
+                                }
+                                LearningTrigger::ErrorDiagnosis { payload } => {
+                                    if let Err(e) = mgr
+                                        .fire_on_system_event(
+                                            "engine",
+                                            "thread_completed_with_issues",
+                                            &thread.user_id,
+                                            Some(payload),
+                                        )
+                                        .await
+                                    {
+                                        debug!(
+                                            "event listener: failed to fire error diagnosis: {e}"
+                                        );
+                                    }
+                                }
+                                LearningTrigger::SkillExtraction { payload } => {
+                                    if let Err(e) = mgr
+                                        .fire_on_system_event(
+                                            "engine",
+                                            "thread_completed_with_learnings",
+                                            &thread.user_id,
+                                            Some(payload),
+                                        )
+                                        .await
+                                    {
+                                        debug!(
+                                            "event listener: failed to fire skill extraction: {e}"
+                                        );
+                                    }
+                                }
+                                LearningTrigger::ConversationInsights {
+                                    completed_thread_count,
+                                } => {
+                                    let thread_goals: Vec<String> = match mgr
+                                        .store
+                                        .list_threads(thread.project_id, &thread.user_id)
+                                        .await
+                                    {
+                                        Ok(threads) => threads
+                                            .iter()
+                                            .rev()
+                                            .take(CONVERSATION_INSIGHTS_INTERVAL as usize)
+                                            .map(|t| t.goal.clone())
+                                            .collect(),
+                                        Err(_) => vec![thread.goal.clone()],
+                                    };
+                                    let payload = build_conversation_insights_payload(
+                                        &thread,
+                                        completed_thread_count,
+                                        thread_goals,
+                                        collect_sample_user_messages(&thread),
                                     );
+
+                                    if let Err(e) = mgr
+                                        .fire_on_system_event(
+                                            "engine",
+                                            "conversation_insights_due",
+                                            &thread.user_id,
+                                            Some(payload),
+                                        )
+                                        .await
+                                    {
+                                        debug!(
+                                            "event listener: failed to fire conversation insights: {e}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2168,6 +2100,16 @@ async fn process_mission_outcome_and_notify(
                     "failed to process skill-repair output: {e}"
                 );
             }
+
+            if is_conversation_insights_mission(&mission)
+                && let Err(e) =
+                    process_conversation_insights_output(store, &mission, thread_id, text).await
+            {
+                debug!(
+                    mission_id = %mission_id,
+                    "failed to process conversation-insights output: {e}"
+                );
+            }
         }
         ThreadOutcome::Completed { response: None } => {}
         ThreadOutcome::Failed { error } => {
@@ -2248,6 +2190,15 @@ fn is_skill_repair_mission(mission: &Mission) -> bool {
     mission
         .metadata
         .get("skill_repair")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Check if a mission is the conversation-insights mission.
+fn is_conversation_insights_mission(mission: &Mission) -> bool {
+    mission
+        .metadata
+        .get("conversation_insights")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
@@ -2422,6 +2373,18 @@ fn extract_json_from_response(response: &str) -> Option<serde_json::Value> {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConversationInsightsMissionOutput {
+    #[serde(default)]
+    preferences: Vec<String>,
+    #[serde(default)]
+    workflow_patterns: Vec<String>,
+    #[serde(default)]
+    domain_facts: Vec<String>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SkillRepairMissionOutput {
     doc_id: DocId,
     repair_type: SkillRepairType,
@@ -2434,6 +2397,328 @@ struct SkillRepairMissionOutput {
     activation: Option<ActivationCriteria>,
     #[serde(default)]
     code_snippets: Option<Vec<CodeSnippet>>,
+}
+
+async fn process_conversation_insights_output(
+    store: &Arc<dyn Store>,
+    mission: &Mission,
+    thread_id: ThreadId,
+    response: &str,
+) -> Result<(), EngineError> {
+    let json_val = match extract_json_from_response(response) {
+        Some(v) => v,
+        None => {
+            debug!("conversation-insights: no structured JSON in response");
+            return Ok(());
+        }
+    };
+
+    let output: ConversationInsightsMissionOutput = serde_json::from_value(json_val.clone())
+        .map_err(|e| EngineError::Store {
+            reason: format!("invalid conversation-insights output: {e}"),
+        })?;
+
+    let trigger_context =
+        conversation_insight_trigger_context(mission.last_trigger_payload.as_ref());
+    let preferences = sanitize_conversation_insight_items(output.preferences);
+    let workflow_patterns = sanitize_conversation_insight_items(output.workflow_patterns);
+    let domain_facts = sanitize_conversation_insight_items(output.domain_facts);
+    let summary = normalize_conversation_insight_text(output.summary.as_deref());
+
+    if preferences.is_empty() && workflow_patterns.is_empty() && domain_facts.is_empty() {
+        debug!("conversation-insights: structured output contained no insights");
+        return Ok(());
+    }
+
+    let doc = build_conversation_insights_doc(
+        mission,
+        thread_id,
+        trigger_context.as_ref(),
+        summary.as_deref(),
+        &preferences,
+        &workflow_patterns,
+        &domain_facts,
+    );
+
+    store.save_memory_doc(&doc).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ConversationInsightTriggerContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_thread_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_source_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    thread_goals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sample_user_messages: Vec<String>,
+}
+
+fn conversation_insight_trigger_context(
+    payload: Option<&serde_json::Value>,
+) -> Option<ConversationInsightTriggerContext> {
+    let payload = payload?;
+    let thread_goals = payload
+        .get("thread_goals")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .filter_map(|item| normalize_conversation_insight_text(Some(item)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let sample_user_messages = payload
+        .get("sample_user_messages")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .filter_map(|item| normalize_conversation_insight_text(Some(item)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let ctx = ConversationInsightTriggerContext {
+        completed_thread_count: payload
+            .get("completed_thread_count")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok()),
+        trigger_project_id: payload
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        trigger_source_thread_id: payload
+            .get("source_thread_id")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        thread_goals,
+        sample_user_messages,
+    };
+    if ctx.completed_thread_count.is_none()
+        && ctx.trigger_project_id.is_none()
+        && ctx.trigger_source_thread_id.is_none()
+        && ctx.thread_goals.is_empty()
+        && ctx.sample_user_messages.is_empty()
+    {
+        None
+    } else {
+        Some(ctx)
+    }
+}
+
+fn sanitize_conversation_insight_items(items: Vec<String>) -> Vec<String> {
+    let mut sanitized = Vec::new();
+    let mut seen = HashSet::new();
+    for item in items {
+        if let Some(normalized) = normalize_conversation_insight_text(Some(&item))
+            && seen.insert(normalized.clone())
+        {
+            sanitized.push(normalized);
+        }
+    }
+    sanitized
+}
+
+fn normalize_conversation_insight_text(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn render_trigger_context_section(context: &ConversationInsightTriggerContext) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(completed_thread_count) = context.completed_thread_count {
+        lines.push(format!(
+            "- Completed thread count: {completed_thread_count}"
+        ));
+    }
+    if let Some(project_id) = &context.trigger_project_id {
+        lines.push(format!("- Trigger project id: {project_id}"));
+    }
+    if let Some(source_thread_id) = &context.trigger_source_thread_id {
+        lines.push(format!("- Trigger source thread id: {source_thread_id}"));
+    }
+    if !context.thread_goals.is_empty() {
+        lines.push("- Recent thread goals:".to_string());
+        lines.extend(
+            context
+                .thread_goals
+                .iter()
+                .map(|goal| format!("  - {goal}")),
+        );
+    }
+    if !context.sample_user_messages.is_empty() {
+        lines.push("- Sample user messages:".to_string());
+        lines.extend(
+            context
+                .sample_user_messages
+                .iter()
+                .map(|message| format!("  - {message}")),
+        );
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!("Trigger Context\n{}", lines.join("\n")))
+    }
+}
+
+fn render_list_section(title: &str, items: &[String]) -> Option<String> {
+    if items.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{title}\n{}",
+            items
+                .iter()
+                .map(|value| format!("- {value}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+    }
+}
+
+fn render_summary_section(summary: Option<&str>) -> Option<String> {
+    summary.map(|summary| format!("Summary\n- {summary}"))
+}
+
+fn build_conversation_insights_structured_output(
+    summary: Option<&str>,
+    preferences: &[String],
+    workflow_patterns: &[String],
+    domain_facts: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "preferences": preferences,
+        "workflow_patterns": workflow_patterns,
+        "domain_facts": domain_facts,
+        "summary": summary,
+    })
+}
+
+fn build_conversation_insight_metadata(
+    mission: &Mission,
+    thread_id: ThreadId,
+    trigger_context: Option<&ConversationInsightTriggerContext>,
+    summary: Option<&str>,
+    preferences: &[String],
+    workflow_patterns: &[String],
+    domain_facts: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "mission_id": mission.id.0.to_string(),
+        "mission_name": mission.name.clone(),
+        "project_id": mission.project_id.0.to_string(),
+        "mission_thread_id": thread_id.0.to_string(),
+        "source_thread_id": thread_id.0.to_string(),
+        "trigger_context": trigger_context,
+        "insight_type": "conversation_insight",
+        "structured_output": build_conversation_insights_structured_output(
+            summary,
+            preferences,
+            workflow_patterns,
+            domain_facts,
+        ),
+    })
+}
+
+fn build_conversation_insights_doc(
+    mission: &Mission,
+    thread_id: ThreadId,
+    trigger_context: Option<&ConversationInsightTriggerContext>,
+    summary: Option<&str>,
+    preferences: &[String],
+    workflow_patterns: &[String],
+    domain_facts: &[String],
+) -> MemoryDoc {
+    let title = build_conversation_insights_title(summary);
+    let content = render_conversation_insights_doc_content(
+        summary,
+        preferences,
+        workflow_patterns,
+        domain_facts,
+        trigger_context,
+    );
+    let mut doc = MemoryDoc::new(
+        mission.project_id,
+        &mission.user_id,
+        DocType::Note,
+        title,
+        content,
+    )
+    .with_source_thread(thread_id)
+    .with_tags(vec!["conversation_insight".to_string()]);
+    doc.metadata = build_conversation_insight_metadata(
+        mission,
+        thread_id,
+        trigger_context,
+        summary,
+        preferences,
+        workflow_patterns,
+        domain_facts,
+    );
+    doc
+}
+
+fn build_conversation_insights_title(summary: Option<&str>) -> String {
+    match summary {
+        Some(summary) => format!(
+            "conversation_insight: {}",
+            truncate_insight_title(summary, 80)
+        ),
+        None => "conversation_insight: structured summary".to_string(),
+    }
+}
+
+fn truncate_insight_title(summary: &str, max_chars: usize) -> String {
+    let mut truncated = String::new();
+    for ch in summary.chars().take(max_chars) {
+        truncated.push(ch);
+    }
+    if summary.chars().count() > max_chars {
+        truncated.push('…');
+    }
+    truncated
+}
+
+fn render_conversation_insights_doc_content(
+    summary: Option<&str>,
+    preferences: &[String],
+    workflow_patterns: &[String],
+    domain_facts: &[String],
+    trigger_context: Option<&ConversationInsightTriggerContext>,
+) -> String {
+    let mut sections = Vec::new();
+
+    if let Some(section) = render_summary_section(summary) {
+        sections.push(section);
+    }
+    if let Some(section) = render_list_section("Preferences", preferences) {
+        sections.push(section);
+    }
+    if let Some(section) = render_list_section("Workflow Patterns", workflow_patterns) {
+        sections.push(section);
+    }
+    if let Some(section) = render_list_section("Domain Facts", domain_facts) {
+        sections.push(section);
+    }
+    if let Some(context) = trigger_context
+        && let Some(section) = render_trigger_context_section(context)
+    {
+        sections.push(section);
+    }
+
+    sections.join("\n\n")
 }
 
 async fn process_skill_repair_output(
@@ -2571,6 +2856,176 @@ fn triggered_skill_provenance(mission: &Mission, doc_id: DocId) -> Option<Active
         .cloned()
         .and_then(|value| serde_json::from_value::<Vec<ActiveSkillProvenance>>(value).ok())
         .and_then(|skills| skills.into_iter().find(|skill| skill.doc_id == doc_id))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LearningTrigger {
+    SkillRepair { payload: serde_json::Value },
+    ErrorDiagnosis { payload: serde_json::Value },
+    SkillExtraction { payload: serde_json::Value },
+    ConversationInsights { completed_thread_count: u32 },
+}
+
+fn route_learning_triggers(
+    thread: &Thread,
+    terminal_state: ThreadState,
+    trace: &ExecutionTrace,
+    error_messages: &[String],
+    active_skills: &[ActiveSkillProvenance],
+    conversation_completion_count: Option<u32>,
+) -> Vec<LearningTrigger> {
+    let mut triggers = Vec::new();
+
+    if let Some(payload) = build_skill_repair_trigger_payload(thread, trace, active_skills) {
+        triggers.push(LearningTrigger::SkillRepair { payload });
+    }
+
+    if let Some(payload) = build_error_diagnosis_trigger_payload(thread, trace, error_messages) {
+        triggers.push(LearningTrigger::ErrorDiagnosis { payload });
+    }
+
+    if let Some(payload) = build_skill_extraction_trigger_payload(thread, terminal_state, trace) {
+        triggers.push(LearningTrigger::SkillExtraction { payload });
+    }
+
+    if terminal_state == ThreadState::Done
+        && let Some(completed_thread_count) = conversation_completion_count
+        && completed_thread_count > 0
+        && completed_thread_count.is_multiple_of(CONVERSATION_INSIGHTS_INTERVAL)
+    {
+        triggers.push(LearningTrigger::ConversationInsights {
+            completed_thread_count,
+        });
+    }
+
+    triggers
+}
+
+fn build_skill_repair_trigger_payload(
+    thread: &Thread,
+    trace: &ExecutionTrace,
+    active_skills: &[ActiveSkillProvenance],
+) -> Option<serde_json::Value> {
+    if active_skills.is_empty() {
+        return None;
+    }
+    build_skill_gap_payload(thread, trace, active_skills)
+}
+
+fn build_error_diagnosis_trigger_payload(
+    thread: &Thread,
+    trace: &ExecutionTrace,
+    error_messages: &[String],
+) -> Option<serde_json::Value> {
+    if trace.issues.is_empty() {
+        return None;
+    }
+
+    let issues: Vec<serde_json::Value> = trace
+        .issues
+        .iter()
+        .map(|issue| {
+            serde_json::json!({
+                "severity": format!("{:?}", issue.severity),
+                "category": issue.category.clone(),
+                "description": issue.description.clone(),
+                "step": issue.step,
+            })
+        })
+        .collect();
+
+    Some(serde_json::json!({
+        "source_thread_id": thread.id.0.to_string(),
+        "goal": thread.goal,
+        "issues": issues,
+        "error_messages": error_messages,
+    }))
+}
+
+fn build_skill_extraction_trigger_payload(
+    thread: &Thread,
+    terminal_state: ThreadState,
+    trace: &ExecutionTrace,
+) -> Option<serde_json::Value> {
+    let action_count = thread
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                crate::types::event::EventKind::ActionExecuted { .. }
+            )
+        })
+        .count();
+
+    let is_candidate = terminal_state == ThreadState::Done
+        && trace
+            .issues
+            .iter()
+            .all(|issue| issue.severity != IssueSeverity::Error)
+        && thread.step_count >= SKILL_EXTRACTION_MIN_STEPS
+        && action_count >= SKILL_EXTRACTION_MIN_ACTIONS;
+    if !is_candidate {
+        return None;
+    }
+
+    let actions_used: Vec<String> = thread
+        .events
+        .iter()
+        .filter_map(|event| {
+            if let crate::types::event::EventKind::ActionExecuted { action_name, .. } = &event.kind
+            {
+                Some(action_name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Some(serde_json::json!({
+        "source_thread_id": thread.id.0.to_string(),
+        "goal": thread.goal,
+        "step_count": thread.step_count,
+        "action_count": action_count,
+        "actions_used": actions_used,
+        "total_tokens": thread.total_tokens_used,
+    }))
+}
+
+fn collect_sample_user_messages(thread: &Thread) -> Vec<String> {
+    thread
+        .messages
+        .iter()
+        .filter(|message| message.role == crate::types::message::MessageRole::User)
+        .filter_map(|message| {
+            let content = message.content.trim();
+            if content.is_empty()
+                || content.starts_with("[stdout]")
+                || content.starts_with("[stderr]")
+                || content.starts_with("[code ")
+                || content.starts_with("Traceback")
+            {
+                return None;
+            }
+
+            Some(content.chars().take(200).collect::<String>())
+        })
+        .take(10)
+        .collect()
+}
+
+fn build_conversation_insights_payload(
+    thread: &Thread,
+    completed_thread_count: u32,
+    thread_goals: Vec<String>,
+    sample_user_messages: Vec<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": thread.project_id.0.to_string(),
+        "completed_thread_count": completed_thread_count,
+        "thread_goals": thread_goals,
+        "sample_user_messages": sample_user_messages,
+    })
 }
 
 /// Collects error messages and deduplicated observed action names in a single
@@ -3957,6 +4412,396 @@ mod tests {
 
         let docs = store.list_memory_docs(project_id, "system").await.unwrap();
         assert!(docs.is_empty(), "non-SI mission should not create overlay");
+    }
+
+    #[tokio::test]
+    async fn conversation_insights_outcome_persists_structured_memory_doc() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "conversation-insights",
+            "extract insights",
+            MissionCadence::Manual,
+        );
+        mission.metadata = serde_json::json!({"conversation_insights": true});
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        let response = serde_json::json!({
+            "preferences": [" Prefer   concise summaries ", "Show exact file paths", "Show exact file paths"],
+            "workflow_patterns": ["Usually asks for implementation before refactoring"],
+            "domain_facts": ["Project uses Rust mission runtime"],
+            "summary": "  User   prefers concise engineering updates  "
+        })
+        .to_string();
+        {
+            let mut missions = store.missions.write().await;
+            if let Some(mission) = missions.get_mut(&id) {
+                mission.last_trigger_payload = Some(serde_json::json!({
+                    "project_id": project_id.0.to_string(),
+                    "completed_thread_count": 5,
+                    "thread_goals": ["audit mission learning", "persist structured insights"],
+                    "sample_user_messages": ["Prefer concise summaries", "Show exact file paths"]
+                }));
+            }
+        }
+        let outcome = ThreadOutcome::Completed {
+            response: Some(response),
+        };
+
+        process_mission_outcome(&store, id, thread_id, &outcome)
+            .await
+            .unwrap();
+
+        let docs = store
+            .list_memory_docs(project_id, "test-user")
+            .await
+            .unwrap();
+        assert_eq!(
+            docs.len(),
+            1,
+            "conversation insights should persist one doc"
+        );
+        let doc = &docs[0];
+        assert_eq!(doc.doc_type, DocType::Note);
+        assert_eq!(doc.user_id, "test-user");
+        assert_eq!(doc.source_thread_id, Some(thread_id));
+        assert!(doc.tags.contains(&"conversation_insight".to_string()));
+        assert_eq!(
+            doc.title,
+            "conversation_insight: User prefers concise engineering updates"
+        );
+        assert!(doc.content.contains("Summary"));
+        assert!(doc.content.contains("Preferences"));
+        assert!(doc.content.contains("Workflow Patterns"));
+        assert!(doc.content.contains("Domain Facts"));
+        assert!(doc.content.contains("Trigger Context"));
+        assert_eq!(
+            doc.metadata["structured_output"]["preferences"]
+                .as_array()
+                .map(Vec::len),
+            Some(2),
+            "duplicate preferences should be removed"
+        );
+        assert_eq!(
+            doc.metadata["structured_output"]["preferences"][0],
+            serde_json::Value::String("Prefer concise summaries".into())
+        );
+        assert_eq!(
+            doc.metadata["structured_output"]["summary"],
+            serde_json::Value::String("User prefers concise engineering updates".into())
+        );
+        assert_eq!(
+            doc.metadata["trigger_context"]["completed_thread_count"],
+            serde_json::Value::from(5)
+        );
+        assert_eq!(
+            doc.metadata["source_thread_id"],
+            serde_json::Value::String(thread_id.0.to_string())
+        );
+        assert_eq!(
+            doc.metadata["mission_thread_id"],
+            serde_json::Value::String(thread_id.0.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_insights_outcome_ignores_non_json_response() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "conversation-insights",
+            "extract insights",
+            MissionCadence::Manual,
+        );
+        mission.metadata = serde_json::json!({"conversation_insights": true});
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        let outcome = ThreadOutcome::Completed {
+            response: Some("No new insights found.".into()),
+        };
+        process_mission_outcome(&store, id, ThreadId::new(), &outcome)
+            .await
+            .unwrap();
+
+        let docs = store
+            .list_memory_docs(project_id, "test-user")
+            .await
+            .unwrap();
+        assert!(
+            docs.is_empty(),
+            "non-JSON insight output should not persist docs"
+        );
+    }
+
+    #[test]
+    fn route_learning_triggers_preserves_existing_trigger_conditions() {
+        let project_id = ProjectId::new();
+        let mut thread = Thread::new(
+            "repair the mission pipeline",
+            ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Done;
+        thread.step_count = 6;
+        thread.total_tokens_used = 1234;
+        thread.goal = "repair the mission pipeline".to_string();
+        thread
+            .set_active_skills(&[ActiveSkillProvenance {
+                doc_id: DocId::new(),
+                name: "mission-debugging".to_string(),
+                version: 2,
+                snippet_names: vec![],
+                force_activated: false,
+            }])
+            .unwrap();
+        thread.add_event(crate::types::event::EventKind::ActionExecuted {
+            step_id: StepId::new(),
+            action_name: "read".to_string(),
+            call_id: "call_1".to_string(),
+            duration_ms: 5,
+            params_summary: Some("mission.rs".to_string()),
+        });
+        thread.add_event(crate::types::event::EventKind::ActionExecuted {
+            step_id: StepId::new(),
+            action_name: "edit".to_string(),
+            call_id: "call_2".to_string(),
+            duration_ms: 5,
+            params_summary: Some("mission.rs".to_string()),
+        });
+        thread.add_event(crate::types::event::EventKind::ActionExecuted {
+            step_id: StepId::new(),
+            action_name: "shell".to_string(),
+            call_id: "call_3".to_string(),
+            duration_ms: 5,
+            params_summary: Some("cargo test -p ironclaw_engine".to_string()),
+        });
+        thread.add_event(crate::types::event::EventKind::ActionFailed {
+            step_id: StepId::new(),
+            action_name: "shell".to_string(),
+            call_id: "call_4".to_string(),
+            error: "cargo test failed".to_string(),
+            params_summary: Some("cargo test -p ironclaw_engine".to_string()),
+        });
+
+        let trace = crate::executor::trace::build_trace(&thread);
+        let (error_messages, _) = collect_errors_and_actions(&thread);
+        let triggers = route_learning_triggers(
+            &thread,
+            ThreadState::Done,
+            &trace,
+            &error_messages,
+            &thread.active_skills(),
+            Some(CONVERSATION_INSIGHTS_INTERVAL),
+        );
+
+        assert!(
+            triggers
+                .iter()
+                .any(|trigger| matches!(trigger, LearningTrigger::SkillRepair { .. })),
+            "active skills with a gap should still trigger skill repair"
+        );
+        assert!(
+            triggers
+                .iter()
+                .any(|trigger| matches!(trigger, LearningTrigger::ErrorDiagnosis { .. })),
+            "trace issues should still trigger error diagnosis"
+        );
+        assert!(
+            triggers
+                .iter()
+                .any(|trigger| matches!(trigger, LearningTrigger::SkillExtraction { .. })),
+            "successful multi-step threads should still trigger skill extraction"
+        );
+        assert!(
+            triggers.iter().any(|trigger| matches!(
+                trigger,
+                LearningTrigger::ConversationInsights {
+                    completed_thread_count: CONVERSATION_INSIGHTS_INTERVAL
+                }
+            )),
+            "every fifth successful completion should still trigger conversation insights"
+        );
+    }
+
+    #[test]
+    fn route_learning_triggers_skips_conversation_insights_for_failed_threads() {
+        let project_id = ProjectId::new();
+        let thread = Thread::new(
+            "failed run",
+            ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        let trace = crate::executor::trace::build_trace(&thread);
+        let triggers = route_learning_triggers(
+            &thread,
+            ThreadState::Failed,
+            &trace,
+            &[],
+            &[],
+            Some(CONVERSATION_INSIGHTS_INTERVAL),
+        );
+
+        assert!(
+            !triggers
+                .iter()
+                .any(|trigger| matches!(trigger, LearningTrigger::ConversationInsights { .. })),
+            "failed threads must not count toward conversation insights"
+        );
+    }
+
+    #[test]
+    fn route_learning_triggers_skips_conversation_insights_for_zero_count() {
+        let project_id = ProjectId::new();
+        let mut thread = Thread::new(
+            "successful run",
+            ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread.state = ThreadState::Done;
+
+        let trace = crate::executor::trace::build_trace(&thread);
+        let triggers =
+            route_learning_triggers(&thread, ThreadState::Done, &trace, &[], &[], Some(0));
+
+        assert!(
+            !triggers
+                .iter()
+                .any(|trigger| matches!(trigger, LearningTrigger::ConversationInsights { .. })),
+            "zero completed-thread counts should not trigger conversation insights"
+        );
+    }
+
+    #[test]
+    fn collect_sample_user_messages_skips_runtime_output_noise() {
+        let project_id = ProjectId::new();
+        let mut thread = Thread::new(
+            "capture user context",
+            ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+
+        thread.add_message(ThreadMessage::user("   "));
+        thread.add_message(ThreadMessage::user("[stdout] cargo test output"));
+        thread.add_message(ThreadMessage::user("Traceback: boom"));
+        thread.add_message(ThreadMessage::assistant("internal note"));
+        thread.add_message(ThreadMessage::user(
+            "Need concise updates with exact file paths",
+        ));
+
+        let messages = collect_sample_user_messages(&thread);
+
+        assert_eq!(
+            messages,
+            vec!["Need concise updates with exact file paths".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_insights_mission_roundtrip_processes_outcome_through_caller() {
+        let store = Arc::new(TestStore::new());
+        let response = serde_json::json!({
+            "preferences": ["Prefer Rust-first fixes"],
+            "workflow_patterns": ["Requests summaries before larger refactors"],
+            "domain_facts": ["Engine stores mission state in MemoryDoc"],
+            "summary": "Conversation insight generated through the mission path"
+        })
+        .to_string();
+        let mgr =
+            make_mission_manager_with_response(Arc::clone(&store) as Arc<dyn Store>, &response);
+        let project_id = ProjectId::new();
+
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "conversation-insights",
+            "extract insights",
+            MissionCadence::Manual,
+        );
+        mission.metadata = serde_json::json!({"conversation_insights": true});
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        let thread_id = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(thread_id.is_some());
+        let thread_id = thread_id.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let docs = store
+            .list_memory_docs(project_id, "test-user")
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 1, "caller path should persist the insight doc");
+        assert_eq!(
+            docs[0].metadata["mission_id"],
+            serde_json::Value::String(id.0.to_string())
+        );
+        assert_eq!(
+            docs[0].metadata["mission_thread_id"],
+            serde_json::Value::String(thread_id.0.to_string())
+        );
+        assert!(
+            docs[0].content.contains("Preferences")
+                && docs[0].content.contains("Workflow Patterns")
+                && docs[0].content.contains("Domain Facts"),
+            "caller path doc should keep the reviewable sectioned format"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_insights_outcome_skips_empty_structured_payload() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "conversation-insights",
+            "extract insights",
+            MissionCadence::Manual,
+        );
+        mission.metadata = serde_json::json!({"conversation_insights": true});
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        let response = serde_json::json!({
+            "preferences": [],
+            "workflow_patterns": [],
+            "domain_facts": [],
+            "summary": "Nothing new"
+        })
+        .to_string();
+        let outcome = ThreadOutcome::Completed {
+            response: Some(response),
+        };
+        process_mission_outcome(&store, id, ThreadId::new(), &outcome)
+            .await
+            .unwrap();
+
+        let docs = store
+            .list_memory_docs(project_id, "test-user")
+            .await
+            .unwrap();
+        assert!(
+            docs.is_empty(),
+            "empty structured insight payload should not persist docs"
+        );
     }
 
     #[tokio::test]
